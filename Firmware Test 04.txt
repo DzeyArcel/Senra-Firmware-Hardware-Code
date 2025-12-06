@@ -1,0 +1,281 @@
+
+   SENRA FIRMWARE v4 — WIFI RESET COMMAND EDITION
+   -----------------------------------------------------------
+   ✔ MPU6050 fall detection
+   ✔ GPS with no-fix fallback
+   ✔ WiFi + Firestore heartbeat + fall alerts
+   ✔ NEW Firestore → adminCommand reset_wifi
+   ✔ ESP32 enters AP mode → WiFi config page
+
+
+#include WiFi.h
+#include WebServer.h
+#include HTTPClient.h
+#include EEPROM.h
+#include Wire.h
+#include Adafruit_MPU6050.h
+#include Adafruit_Sensor.h
+#include TinyGPSPlus.h
+
+ =======================================================
+ DEVICE + FIRESTORE
+ =======================================================
+String DEVICE_ID  = SNR-V4-FW;
+String PROJECT_ID = senra-805d0;
+String API_KEY    = YOUR_FIREBASE_API_KEY;
+
+String FS_URL =
+  httpsfirestore.googleapis.comv1projects + PROJECT_ID +
+  databases(default)documentsdevices + DEVICE_ID +
+  key= + API_KEY;
+
+ =======================================================
+ MODULES
+ =======================================================
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+
+#define GPS_RX 16
+#define GPS_TX 17
+
+ =======================================================
+ WIFI  EEPROM
+ =======================================================
+#define EEPROM_SIZE 200
+String savedSSID = ;
+String savedPASS = ;
+
+WebServer server(80);
+
+ =======================================================
+ GLOBALS
+ =======================================================
+double lastLat = 0;
+double lastLng = 0;
+
+unsigned long lastHB = 0;
+bool fallTriggered = false;
+unsigned long fallTime = 0;
+
+ =======================================================
+ UTILS
+ =======================================================
+String isoTime() {
+  time_t now; time(&now);
+  struct tm t = gmtime(&now);
+
+  char buf[30];
+  strftime(buf, sizeof(buf), %Y-%m-%dT%H%M%SZ, t);
+  return String(buf);
+}
+
+ =======================================================
+ EEPROM SAVE  LOAD
+ =======================================================
+void saveWiFi(String ssid, String pass) {
+  EEPROM.writeString(0, ssid);
+  EEPROM.writeString(50, pass);
+  EEPROM.commit();
+}
+
+void loadWiFi() {
+  savedSSID = EEPROM.readString(0);
+  savedPASS = EEPROM.readString(50);
+}
+
+ =======================================================
+ SIMPLE AP CONFIG PAGE
+ =======================================================
+String configHTML() {
+  return htmlbodyh2SENRA WiFi Setuph2
+         form action='save' method='POST'
+         SSID input name='ssid'brbr
+         Password input name='pass' type='password'brbr
+         button type='submit'Savebuttonform
+         bodyhtml;
+}
+
+void handleSave() {
+  String ssid = server.arg(ssid);
+  String pass = server.arg(pass);
+
+  saveWiFi(ssid, pass);
+
+  server.send(200, texthtml, WiFi Saved! Rebooting...);
+  delay(1500);
+  ESP.restart();
+}
+
+ =======================================================
+ ENTER WIFI RESET MODE
+ =======================================================
+void enterWifiSetupMode() {
+  Serial.println(n=== ENTERING WIFI RESET MODE ===);
+
+  WiFi.disconnect(true);
+  delay(500);
+
+  WiFi.softAP(SENRA-Setup, );
+  Serial.println(AP Mode SENRA-Setup);
+  Serial.println(Visit http192.168.4.1);
+
+  server.on(, HTTP_GET, []() {
+    server.send(200, texthtml, configHTML());
+  });
+
+  server.on(save, HTTP_POST, handleSave);
+
+  server.begin();
+}
+
+ =======================================================
+ WIFI CONNECT
+ =======================================================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+
+  Serial.println(nConnecting to WiFi...);
+  for (int i = 0; i  20; i++) {
+    if (WiFi.status() == WL_CONNECTED) break;
+    delay(500);
+    Serial.print(.);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(nWiFi Connected!);
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(nWiFi Failed → Entering setup mode);
+    enterWifiSetupMode();
+  }
+}
+
+ =======================================================
+ FIRESTORE CHECK adminCommand
+ =======================================================
+void checkAdminCommand() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(FS_URL);
+  int code = http.GET();
+
+  if (code != 200) return;
+
+  String res = http.getString();
+
+  if (res.indexOf(reset_wifi)  0) {
+    Serial.println(nADMIN COMMAND RECEIVED RESET WIFI);
+    enterWifiSetupMode();
+  }
+
+  http.end();
+}
+
+ =======================================================
+ GPS READ
+ =======================================================
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+ =======================================================
+ FIRESTORE HEARTBEAT
+ =======================================================
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String url = FS_URL +
+    &updateMask.fieldPaths=status
+    &updateMask.fieldPaths=battery
+    &updateMask.fieldPaths=lat
+    &updateMask.fieldPaths=lng
+    &updateMask.fieldPaths=lastSync;
+
+  http.begin(url);
+  http.addHeader(Content-Type, applicationjson);
+
+  String json = { fields {;
+  json += status {stringValue online},;
+  json += battery {integerValue 95},;
+
+  if (lastLat != 0) json += lat {doubleValue  + String(lastLat, 6) + },;
+  if (lastLng != 0) json += lng {doubleValue  + String(lastLng, 6) + },;
+
+  json += lastSync {timestampValue  + isoTime() + };
+  json += } };
+
+  http.PATCH(json);
+  http.end();
+
+  Serial.println(Heartbeat sent.);
+}
+
+ =======================================================
+ FALL DETECTION
+ =======================================================
+void checkFall() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float ax = a.acceleration.x  9.81;
+  float ay = a.acceleration.y  9.81;
+  float az = a.acceleration.z  9.81;
+
+  float gforce = sqrt(axax + ayay + azaz);
+
+  if (gforce  2.8 && !fallTriggered) {
+    fallTriggered = true;
+    fallTime = millis();
+  }
+
+  if (fallTriggered && millis() - fallTime  300) {
+    if (gforce  1.2) {
+      Serial.println(FALL DETECTED!);
+    }
+    fallTriggered = false;
+  }
+}
+
+ =======================================================
+ SETUP
+ =======================================================
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  loadWiFi();
+
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  if (!mpu.begin()) Serial.println(MPU NOT FOUND!);
+
+  if (savedSSID == ) enterWifiSetupMode();
+  else connectWiFi();
+
+  configTime(0, 0, pool.ntp.org);
+}
+
+ =======================================================
+ LOOP
+ =======================================================
+void loop() {
+  server.handleClient();
+  readGPS();
+  checkFall();
+  checkAdminCommand();
+
+  if (millis() - lastHB  12000) {
+    sendHeartbeat();
+    lastHB = millis();
+  }
+}

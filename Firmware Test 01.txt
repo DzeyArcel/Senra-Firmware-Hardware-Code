@@ -1,0 +1,54 @@
+/*************************************************************
+   SENRA FIRMWARE v1 — MPU6050 FALL TEST
+   -----------------------------------------------------------
+   ✔ Reads MPU6050 acceleration
+   ✔ Simple fall detection (2.5g impact)
+   ✔ Prints results to Serial Monitor
+*************************************************************/
+
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+Adafruit_MPU6050 mpu;
+
+bool fall = false;
+unsigned long impactTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 NOT FOUND!");
+    while (1);
+  }
+
+  Serial.println("MPU6050 READY — FALL TEST MODE");
+}
+
+void loop() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+  float gForce = sqrt(ax*ax + ay*ay + az*az);
+
+  Serial.print("G-Force: ");
+  Serial.println(gForce);
+
+  if (gForce > 2.5 && !fall) {
+    fall = true;
+    impactTime = millis();
+  }
+
+  if (fall && millis() - impactTime > 300) {
+    if (gForce < 1.2) {
+      Serial.println("⚠ FALL DETECTED!");
+    }
+    fall = false;
+  }
+
+  delay(80);
+}

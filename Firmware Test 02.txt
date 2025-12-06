@@ -1,0 +1,211 @@
+/*************************************************************
+   SENRA FIRMWARE v2 — MPU + GPS + WIFI + FIRESTORE
+   -----------------------------------------------------------
+   ✔ MPU6050 basic fall detection
+   ✔ GPS read + “No Fix” fallback
+   ✔ WiFi connection
+   ✔ Firestore HEARTBEAT + FALL ALERT
+   ✔ Clean & simple for GitHub documentation
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+
+// ------------------------------
+// DEVICE INFO
+// ------------------------------
+String DEVICE_ID = "SNR-V2-DEMO";
+String PROJECT_ID = "senra-805d0";
+String API_KEY    = "YOUR_FIREBASE_API_KEY";
+
+// FIRESTORE REST URL
+String FS_URL =
+  "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+  "/databases/(default)/documents/devices/" + DEVICE_ID +
+  "?key=" + API_KEY;
+
+// ------------------------------
+// WIFI SETTINGS
+// ------------------------------
+const char* WIFI_SSID = "YOUR_WIFI";
+const char* WIFI_PASS = "YOUR_PASSWORD";
+
+// ------------------------------
+// MPU6050
+// ------------------------------
+Adafruit_MPU6050 mpu;
+
+bool fallTriggered = false;
+unsigned long impactTime = 0;
+
+// ------------------------------
+// GPS
+// ------------------------------
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+
+#define GPS_RX 16
+#define GPS_TX 17
+
+double lastLat = 0;
+double lastLng = 0;
+
+// ------------------------------
+// TIMESTAMP IN ISO8601
+// ------------------------------
+String isoTime() {
+  time_t now; time(&now);
+  struct tm *t = gmtime(&now);
+
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buf);
+}
+
+// ------------------------------
+// READ GPS
+// ------------------------------
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// ------------------------------
+// HEARTBEAT SEND
+// ------------------------------
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String url = FS_URL +
+               "&updateMask.fieldPaths=status"
+               "&updateMask.fieldPaths=battery"
+               "&updateMask.fieldPaths=lastSync"
+               "&updateMask.fieldPaths=lat"
+               "&updateMask.fieldPaths=lng";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int battery = random(80, 97);
+
+  String json = "{ \"fields\": {";
+  json += "\"status\": {\"stringValue\": \"online\"},";
+  json += "\"battery\": {\"integerValue\": \"" + String(battery) + "\"},";
+  json += "\"lastSync\": {\"timestampValue\": \"" + isoTime() + "\"},";
+
+  if (lastLat != 0 && lastLng != 0) {
+    json += "\"lat\": {\"doubleValue\": " + String(lastLat, 6) + "},";
+    json += "\"lng\": {\"doubleValue\": " + String(lastLng, 6) + "},";
+  }
+
+  json += "} }";
+
+  Serial.println("\n=== HEARTBEAT SENT ===");
+  Serial.println(json);
+
+  http.PATCH(json);
+  http.end();
+}
+
+// ------------------------------
+// FALL ALERT
+// ------------------------------
+void sendFallAlert() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(FS_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  String mapURL = "https://www.google.com/maps?q=" + 
+                  String(lastLat, 6) + "," + String(lastLng, 6);
+
+  String json = "{ \"fields\": {";
+  json += "\"fallDetected\": {\"booleanValue\": true},";
+  json += "\"fallTimestamp\": {\"timestampValue\": \"" + isoTime() + "\"},";
+  json += "\"lat\": {\"doubleValue\": " + String(lastLat, 6) + "},";
+  json += "\"lng\": {\"doubleValue\": " + String(lastLng, 6) + "},";
+  json += "\"mapURL\": {\"stringValue\": \"" + mapURL + "\"}";
+  json += "} }";
+
+  Serial.println("\n=== FALL ALERT SENT ===");
+  Serial.println(json);
+
+  http.PATCH(json);
+  http.end();
+}
+
+// ------------------------------
+// FALL DETECTION
+// ------------------------------
+void checkFall() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+
+  float gForce = sqrt(ax * ax + ay * ay + az * az);
+
+  if (gForce >= 2.8 && !fallTriggered) {
+    fallTriggered = true;
+    impactTime = millis();
+  }
+
+  if (fallTriggered && millis() - impactTime > 300) {
+    if (gForce < 1.2) {
+      sendFallAlert();
+    }
+    fallTriggered = false;
+  }
+}
+
+// ------------------------------
+// SETUP
+// ------------------------------
+unsigned long lastHB = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi…");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nConnected!");
+
+  configTime(0, 0, "pool.ntp.org");
+
+  // GPS
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // MPU
+  if (!mpu.begin()) Serial.println("MPU NOT FOUND!");
+}
+
+// ------------------------------
+// LOOP
+// ------------------------------
+void loop() {
+  readGPS();
+  checkFall();
+
+  if (millis() - lastHB > 12000) {
+    sendHeartbeat();
+    lastHB = millis();
+  }
+}
