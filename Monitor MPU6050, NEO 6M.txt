@@ -1,0 +1,82 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+
+// -------- Objects --------
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2); // UART2 on ESP32
+
+// -------- Pins --------
+#define GPS_RX_PIN 16  // NEO-6M TX → ESP32 GPIO16 (RX2)
+#define GPS_TX_PIN 17  // (Optional) ESP32 TX2 → NEO-6M RX
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22); // I2C pins
+
+  // ----- Initialize MPU6050 -----
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    while (1) delay(100);
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // ----- Initialize GPS UART -----
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  Serial.println("Monitoring MPU6050 + NEO-6M GPS...");
+  Serial.println("--------------------------------");
+}
+
+void loop() {
+
+  // ========== Read MPU6050 ==========
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax_G = a.acceleration.x / 9.81;
+  float ay_G = a.acceleration.y / 9.81;
+  float az_G = a.acceleration.z / 9.81;
+  float gyroX = g.gyro.x * 57.2958; // deg/s
+  float gyroY = g.gyro.y * 57.2958;
+  float gyroZ = g.gyro.z * 57.2958;
+
+  Serial.print("[MPU] Accel(g): X=");
+  Serial.print(ax_G, 2);
+  Serial.print(" Y=");
+  Serial.print(ay_G, 2);
+  Serial.print(" Z=");
+  Serial.print(az_G, 2);
+
+  Serial.print(" | Gyro(dps): X=");
+  Serial.print(gyroX, 1);
+  Serial.print(" Y=");
+  Serial.print(gyroY, 1);
+  Serial.print(" Z=");
+  Serial.println(gyroZ, 1);
+
+  // ========== Read GPS ==========
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  if (gps.location.isUpdated()) {
+    Serial.print("[GPS] Lat=");
+    Serial.print(gps.location.lat(), 6);
+    Serial.print(" Lng=");
+    Serial.print(gps.location.lng(), 6);
+    Serial.print(" | Sat=");
+    Serial.print(gps.satellites.value());
+    Serial.print(" | HDOP=");
+    Serial.println(gps.hdop.value());
+  } else {
+    Serial.println("[GPS] Waiting for fix...");
+  }
+
+  delay(250); // 4Hz print rate for monitoring
+}

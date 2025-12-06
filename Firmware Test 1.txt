@@ -1,0 +1,291 @@
+/*************************************************************
+   SENRA FIRMWARE v11-TEST  
+   COMPLETE TEST BUILD FOR APP + DASHBOARD
+
+   Includes:
+   ✔ Heartbeat (battery, signal, lastSync, WiFi)
+   ✔ GPS (lat/lng reading)
+   ✔ Simple fall detection for testing
+   ✔ Firestore REST upload (aligned to ecosystem)
+   ✔ WiFi setup AP mode (SENRA-SETUP)
+   ✔ MPU6050 on I2C pins 21/22
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+
+#define EEPROM_SIZE 200
+const unsigned long HEARTBEAT_INTERVAL = 15000; // 15 sec test interval
+
+// ==== SENSOR OBJECTS ====
+Adafruit_MPU6050 mpu;
+
+// GPS
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+#define GPS_RX 16
+#define GPS_TX 17
+
+// ==== DEVICE ID ====
+String DEVICE_ID = "SNR-TEST-02";   // Change per device
+
+// ==== FIRESTORE ENDPOINT ====
+const char* PROJECT_ID = "senra-805d0";
+const char* API_KEY    = "AIzaSy4oKFNDsJP3Pv1tLwzWNhSte-dWnFMn6Q";
+
+String firestoreURL =
+  "https://firestore.googleapis.com/v1/projects/" + String(PROJECT_ID) +
+  "/databases/(default)/documents/devices/" + DEVICE_ID +
+  "?key=" + API_KEY;
+
+// ==== EEPROM WiFi ====
+String savedSSID = "";
+String savedPASS = "";
+
+// ------------------------------------------------------------
+// EEPROM HANDLERS
+// ------------------------------------------------------------
+void saveCredentials(String ssid, String pass) {
+  EEPROM.writeString(0, ssid);
+  EEPROM.writeString(50, pass);
+  EEPROM.commit();
+}
+
+void loadCredentials() {
+  savedSSID = EEPROM.readString(0);
+  savedPASS = EEPROM.readString(50);
+}
+
+// ------------------------------------------------------------
+int getBatteryLevel() { return random(82, 98); } // Fake test battery
+
+// ------------------------------------------------------------
+String getISO8601Time() {
+  time_t now;
+  time(&now);
+  struct tm *t = gmtime(&now);
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buffer);
+}
+
+// ------------------------------------------------------------
+// GPS HANDLER
+// ------------------------------------------------------------
+double lastLat = 0;
+double lastLng = 0;
+
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// ------------------------------------------------------------
+// HEARTBEAT SEND
+// ------------------------------------------------------------
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String url = firestoreURL +
+    "&updateMask.fieldPaths=status"
+    "&updateMask.fieldPaths=lastSync"
+    "&updateMask.fieldPaths=batteryLevel"
+    "&updateMask.fieldPaths=lat"
+    "&updateMask.fieldPaths=lng"
+    "&updateMask.fieldPaths=wifiName"
+    "&updateMask.fieldPaths=firmware"
+    "&updateMask.fieldPaths=signal";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int battery = getBatteryLevel();
+  int rssi = WiFi.RSSI();
+
+  String payload = "{ \"fields\": {";
+  payload += "\"status\":       {\"stringValue\": \"online\"},";
+  payload += "\"firmware\":     {\"stringValue\": \"v11-TEST\"},";
+  payload += "\"wifiName\":     {\"stringValue\": \"" + savedSSID + "\"},";
+  payload += "\"batteryLevel\": {\"integerValue\": \"" + String(battery) + "\"},";
+  payload += "\"signal\":       {\"stringValue\": \"" + String(rssi) + "\"},";
+
+  if (lastLat != 0 && lastLng != 0) {
+    payload += "\"lat\": {\"doubleValue\": " + String(lastLat, 6) + "},";
+    payload += "\"lng\": {\"doubleValue\": " + String(lastLng, 6) + "},";
+  }
+
+  payload += "\"lastSync\": {\"timestampValue\": \"" + getISO8601Time() + "\"}";
+  payload += "} }";
+
+  Serial.println("\n[HEARTBEAT]");
+  Serial.println(payload);
+
+  http.PATCH(payload);
+  http.end();
+}
+
+// ------------------------------------------------------------
+// FALL DETECTION (TEST MODE — SIMPLE)
+// ------------------------------------------------------------
+bool fallTriggered = false;
+unsigned long fallStartTime = 0;
+
+void sendFallAlert() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String mapURL = "https://www.google.com/maps?q=" +
+                  String(lastLat, 6) + "," + String(lastLng, 6);
+
+  String payload = "{ \"fields\": {";
+  payload += "\"fallDetected\":  {\"booleanValue\": true},";
+  payload += "\"status\":        {\"stringValue\": \"fall\"},";
+  payload += "\"fallType\":      {\"stringValue\": \"Simple Test Fall\"},";
+  payload += "\"fallTimestamp\": {\"timestampValue\": \"" + getISO8601Time() + "\"},";
+  payload += "\"mapURL\":        {\"stringValue\": \"" + mapURL + "\"},";
+
+  if (lastLat != 0 && lastLng != 0) {
+    payload += "\"lat\": {\"doubleValue\": " + String(lastLat, 6) + "},";
+    payload += "\"lng\": {\"doubleValue\": " + String(lastLng, 6) + "},";
+  }
+
+  payload += "\"lastSync\": {\"timestampValue\": \"" + getISO8601Time() + "\"}";
+  payload += "} }";
+
+  Serial.println("\n=== FALL DETECTED ===");
+  Serial.println(payload);
+
+  http.begin(firestoreURL);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(payload);
+  http.end();
+}
+
+void checkFall() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+
+  float totalG = sqrt(ax*ax + ay*ay + az*az);
+
+  // Step A: detect impact
+  if (totalG > 2.6 && !fallTriggered) {
+    fallTriggered = true;
+    fallStartTime = millis();
+  }
+
+  // Step B: check stillness
+  if (fallTriggered && millis() - fallStartTime > 300) {
+    if (totalG < 1.2) {
+      sendFallAlert();
+    }
+    fallTriggered = false;
+  }
+}
+
+// ------------------------------------------------------------
+// WIFI SETUP PAGE
+// ------------------------------------------------------------
+WebServer server(80);
+
+String configPage() {
+  return "<html><body><h3>SENRA WiFi Setup</h3>"
+         "<form action='/save' method='POST'>"
+         "SSID:<input name='ssid'><br>"
+         "PASS:<input name='pass'><br><br>"
+         "<button>Save</button></form></body></html>";
+}
+
+void handleSave() {
+  saveCredentials(server.arg("ssid"), server.arg("pass"));
+  server.send(200, "text/html", "Saved! Restarting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void startSetupMode() {
+  WiFi.softAP("SENRA-SETUP", "");
+  server.on("/", HTTP_GET, [] { server.send(200, "text/html", configPage()); });
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  Serial.println("WiFi Setup Mode Active!");
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+
+  Serial.println("Connecting...");
+
+  for (int i = 0; i < 20; i++) {
+    if (WiFi.status() == WL_CONNECTED) break;
+    delay(300);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nFailed. Starting Setup.");
+    startSetupMode();
+  } else {
+    Serial.println("\nConnected!");
+    Serial.println(WiFi.localIP());
+  }
+}
+
+// ------------------------------------------------------------
+// SETUP
+// ------------------------------------------------------------
+unsigned long lastHeartbeat = 0;
+
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  loadCredentials();
+
+  // IMPORTANT: I2C pins for MPU6050
+  Wire.begin(21, 22);
+
+  // MPU INIT
+  if (!mpu.begin()) Serial.println("MPU ERROR (OK FOR TEST)");
+
+  // GPS INIT
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  if (savedSSID == "") startSetupMode();
+  else connectWiFi();
+
+  configTime(0,0,"pool.ntp.org");
+}
+
+// ------------------------------------------------------------
+// LOOP
+// ------------------------------------------------------------
+void loop() {
+  server.handleClient();
+  readGPS();
+  checkFall();
+
+  if (WiFi.status() == WL_CONNECTED &&
+      millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
+
+    sendHeartbeat();
+    lastHeartbeat = millis();
+  }
+}

@@ -1,0 +1,34 @@
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+TinyGPSPlus gps;
+HardwareSerial GPSserial(1);
+
+void setup() {
+  Serial.begin(115200);
+  GPSserial.begin(9600, SERIAL_8N1, 16, 17);
+
+  Serial.println("GPS Map Test Started...");
+}
+
+void loop() {
+  while (GPSserial.available()) {
+    gps.encode(GPSserial.read());
+  }
+
+  if (gps.location.isUpdated()) {
+    double lat = gps.location.lat();
+    double lng = gps.location.lng();
+
+    Serial.println("================================");
+    Serial.print("Latitude : "); Serial.println(lat, 6);
+    Serial.print("Longitude: "); Serial.println(lng, 6);
+
+    // Google Maps link
+    Serial.print("🌍 Maps: https://www.google.com/maps?q=");
+    Serial.print(lat, 6);
+    Serial.print(",");
+    Serial.println(lng, 6);
+    Serial.println("================================");
+  }
+}
