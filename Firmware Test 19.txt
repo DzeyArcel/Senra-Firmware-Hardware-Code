@@ -1,0 +1,757 @@
+/*************************************************************
+   SENRA FIRMWARE V15.7 — FULL ECOSYSTEM SAFE
+   ✔ Firestore unlink safety
+   ✔ WiFi reset from app
+   ✔ Caregiver UID binding
+   ✔ Fall detection + buzzer
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ================= CONFIG =================
+String DEVICE_ID = "SNR-TEST-13";
+String PROJECT_ID = "senra-805d0";
+String API_KEY = "AIzaSyA6kFNDsJP3Pv1ltrWrMYh5Ie-dWnFMn6Q";
+
+String deviceURL =
+  "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID + "/databases/(default)/documents/devices/" + DEVICE_ID + "?key=" + API_KEY;
+
+// ================= EEPROM =================
+#define EEPROM_SIZE 512
+#define SSID_ADDR 0
+#define PASS_ADDR 40
+#define CAREGIVER_ADDR 80
+#define DEBUG true
+#define WIFI_RESET_FLAG_ADDR 120
+
+
+// ================= PINS =================
+#define BUZZER_PIN 25
+#define BUTTON_PIN 14
+#define GPS_RX 16
+#define GPS_TX 17
+#define SIM_RX 26
+#define SIM_TX 27
+#define BATTERY_PIN 34
+
+// ================= OBJECTS =================
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+HardwareSerial SIM800(1);
+WebServer server(80);
+
+// ================= FALL STATE =================
+enum FallState { IDLE, CANDIDATE, ALERT_PENDING, POST_ALERT };
+
+FallState fallState = IDLE;
+
+unsigned long fallTime = 0;
+unsigned long alertStart = 0;
+unsigned long lastBuzz = 0;
+unsigned long lastSyncSend = 0;
+unsigned long lastCloudCheck = 0;
+
+double lastLat = 0;
+double lastLng = 0;
+
+// ================= CONSTANTS =================
+const float IMPACT_G = 1.2;
+const float ROT_SPIKE = 90;
+const float STILL_G = 1.05;
+
+const unsigned long CONFIRM_DELAY = 150;
+const unsigned long CANCEL_WINDOW = 8000;
+const unsigned long BUZZ_INTERVAL = 100;
+
+unsigned long wifiConnectedAt = 0;
+const unsigned long WIFI_SETTLE_TIME = 15000; // 15 seconds
+bool wifiResetHandledThisBoot = false;
+bool tcpipReady = false;
+bool waitingCloudClear = false;
+
+
+
+
+
+// ================= HELPER =================
+void setWifiResetFlag(bool v) {
+  EEPROM.write(WIFI_RESET_FLAG_ADDR, v ? 1 : 0);
+  EEPROM.commit();
+  delay(200);        // 🔒 give flash time
+}
+
+
+bool getWifiResetFlag() {
+  return EEPROM.read(WIFI_RESET_FLAG_ADDR) == 1;
+}
+
+void markDeviceOffline() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String json = "{ \"fields\": {\"status\":{\"stringValue\":\"offline\"}}}";
+  String url = deviceURL + "&updateMask.fieldPaths=status";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(json);
+  http.end();
+
+  Serial.println("🔌 Device marked OFFLINE in cloud");
+}
+
+void markDeviceResetting() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String json = "{ \"fields\": {"
+                "\"status\":{\"stringValue\":\"resetting\"},"
+                "\"online\":{\"booleanValue\":false}"
+                "} }";
+
+  String url = deviceURL +
+    "&updateMask.fieldPaths=status" +
+    "&updateMask.fieldPaths=online";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(json);
+  http.end();
+
+  Serial.println("⚠️ Device marked RESETTING");
+}
+
+
+// ================= TIME =================
+String isoTime() {
+  time_t now;
+  time(&now);
+  struct tm* t = gmtime(&now);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buf);
+}
+
+// ================= EEPROM =================
+void saveField(int addr, String v) {
+  for (int i = 0; i < 32; i++)
+    EEPROM.write(addr + i, i < v.length() ? v[i] : 0);
+  EEPROM.commit();
+}
+
+String readField(int addr) {
+  char b[33];
+  for (int i = 0; i < 32; i++) b[i] = EEPROM.read(addr + i);
+  b[32] = '\0';
+  return String(b);
+}
+
+String readSSID() {
+  return readField(SSID_ADDR);
+}
+String readPASS() {
+  return readField(PASS_ADDR);
+}
+String readCaregiverId() {
+  return readField(CAREGIVER_ADDR);
+}
+
+// ================= AP MODE =================
+void handleRoot() {
+  server.send(200, "text/html",
+              "<!DOCTYPE html>"
+              "<html>"
+              "<head>"
+              "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+              "<style>"
+              "*{box-sizing:border-box;}"
+              "body{margin:0;font-family:Arial;background:#0E1625;color:white;}"
+              ".wrap{max-width:420px;margin:40px auto;padding:20px;}"
+              ".card{background:#162233;padding:20px;border-radius:14px;}"
+              "h2{color:#33B5FF;margin-top:0;}"
+              "p{color:#ccc;font-size:14px;}"
+              "input{width:100%;padding:12px;margin-top:10px;"
+              "border-radius:8px;border:none;font-size:16px;}"
+              "button{width:100%;padding:14px;margin-top:16px;"
+              "background:#33B5FF;color:#000;border:none;"
+              "border-radius:10px;font-size:16px;font-weight:bold;}"
+              ".hint{font-size:12px;color:#888;margin-top:12px;}"
+              "</style>"
+              "</head>"
+              "<body>"
+
+              "<div class='wrap'>"
+              "<div class='card'>"
+              "<h2>Connect Senra to Wi-Fi</h2>"
+              "<p>Enter your home Wi-Fi credentials below.</p>"
+
+              "<form action='/setwifi'>"
+              "<input name='s' placeholder='Wi-Fi Name (SSID)' required>"
+              "<input name='p' type='password' placeholder='Wi-Fi Password' required>"
+              "<button type='submit'>Connect</button>"
+              "</form>"
+
+              "<div class='hint'>"
+              "After connecting, return to the Senra app."
+              "</div>"
+              "</div>"
+              "</div>"
+
+              "</body></html>");
+}
+
+void handleSetWiFi() {
+  Serial.println("📡 NEW WIFI RECEIVED");
+
+  // 1️⃣ Save new credentials
+  saveField(SSID_ADDR, server.arg("s"));
+  saveField(PASS_ADDR, server.arg("p"));
+
+  // 2️⃣ Clear local EEPROM reset lock
+  setWifiResetFlag(false);
+  delay(300); // give EEPROM time
+
+  // 3️⃣ Verify EEPROM really cleared
+  if (getWifiResetFlag()) {
+    Serial.println("❌ EEPROM CLEAR FAILED — ABORTING REBOOT");
+    server.send(500, "text/plain", "EEPROM error, retry");
+    return;
+  }
+
+  Serial.println("💾 EEPROM LOCK CLEARED");
+
+  // 4️⃣ Tell cloud: RESET FLOW IS DONE
+  // Clear BOTH flags so pollCloud won't re-trigger
+  HTTPClient clear1;
+  clear1.begin(deviceURL + "&updateMask.fieldPaths=wifiReset");
+  clear1.addHeader("Content-Type", "application/json");
+  clear1.PATCH("{\"fields\":{\"wifiReset\":{\"booleanValue\":false}}}");
+  clear1.end();
+
+  HTTPClient clear2;
+  clear2.begin(deviceURL + "&updateMask.fieldPaths=wifiResetAck");
+  clear2.addHeader("Content-Type", "application/json");
+  clear2.PATCH("{\"fields\":{\"wifiResetAck\":{\"booleanValue\":false}}}");
+  clear2.end();
+
+  delay(1200); // ⏳ give Firestore time to sync
+
+  Serial.println("🔁 REBOOT TO NORMAL MODE");
+  ESP.restart();
+}
+
+
+
+
+void handleSetCaregiver() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain", "Missing caregiver UID");
+    return;
+  }
+
+  String uid = server.arg("id");
+  uid.trim();
+
+  if (uid.length() < 20) {
+    server.send(400, "text/plain", "Invalid UID");
+    return;
+  }
+
+  saveField(CAREGIVER_ADDR, uid);
+  server.send(200, "text/plain", "Caregiver UID linked");
+}
+
+void startAP() {
+  Serial.println("=== STARTING AP MODE ===");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("SENRA_SETUP");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/setwifi", handleSetWiFi);
+  server.on("/setcaregiver", handleSetCaregiver);
+  server.begin();
+}
+
+
+// ================= WIFI =================
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+
+  String ssid = readSSID();
+  ssid.trim();
+  String pass = readPASS();
+  pass.trim();
+
+  Serial.println("----- WIFI DEBUG -----");
+  Serial.print("Stored SSID: [");
+  Serial.print(ssid);
+  Serial.println("]");
+  Serial.print("Stored PASS length: ");
+  Serial.println(pass.length());
+
+  if (ssid.length() == 0) {
+    Serial.println("No SSID found → Starting AP mode");
+    startAP();
+    return false;
+  }
+
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WIFI CONNECTED");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    // 🔥 MARK WIFI STABLE TIME
+    wifiConnectedAt = millis();
+
+
+    server.on("/setcaregiver", handleSetCaregiver);
+    server.begin();
+    return true;
+  }
+
+  Serial.println("❌ WIFI FAILED");
+  Serial.print("WiFi status code: ");
+  Serial.println(WiFi.status());
+
+  startAP();
+  return false;
+}
+
+
+// ================= GPS =================
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// ================= BATTERY =================
+int readBatteryPercent() {
+  float v = analogRead(BATTERY_PIN) / 4095.0 * 3.3 * 2.0;
+  return constrain(map(v * 100, 330, 420, 0, 100), 0, 100);
+}
+
+// ================= FIRESTORE WRITE =================
+void updateDeviceDoc(bool fall, String status) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String json = "{ \"fields\": {";
+  json += "\"status\":{\"stringValue\":\"online\"},";
+  json += "\"fallDetected\":{\"booleanValue\":" + String(fall ? "true" : "false") + "},";
+  json += "\"fallStatus\":{\"stringValue\":\"" + status + "\"},";
+  json += "\"lat\":{\"doubleValue\":" + String(lastLat, 6) + "},";
+  json += "\"lng\":{\"doubleValue\":" + String(lastLng, 6) + "},";
+  json += "\"batteryLevel\":{\"integerValue\":\"" + String(readBatteryPercent()) + "\"},";
+  json += "\"lastSync\":{\"timestampValue\":\"" + isoTime() + "\"}";
+  json += "} }";
+
+ String url = deviceURL +
+  "&updateMask.fieldPaths=status" +
+  "&updateMask.fieldPaths=fallDetected" +
+  "&updateMask.fieldPaths=fallStatus" +
+  "&updateMask.fieldPaths=lat" +
+  "&updateMask.fieldPaths=lng" +
+  "&updateMask.fieldPaths=batteryLevel" +
+  "&updateMask.fieldPaths=lastSync";
+
+http.begin(url);
+http.addHeader("Content-Type", "application/json");
+http.PATCH(json);
+http.end();
+}
+
+// ================= ALERT =================
+void createAlert() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String caregiverId = readCaregiverId();
+  if (caregiverId.length() == 0) return;
+
+  HTTPClient http;
+  String url = "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID + "/databases/(default)/documents/alerts?key=" + API_KEY;
+
+  String json = "{ \"fields\": {";
+  json += "\"deviceId\":{\"stringValue\":\"" + DEVICE_ID + "\"},";
+  json += "\"caregiverId\":{\"stringValue\":\"" + caregiverId + "\"},";
+  json += "\"lat\":{\"doubleValue\":" + String(lastLat, 6) + "},";
+  json += "\"lng\":{\"doubleValue\":" + String(lastLng, 6) + "},";
+  json += "\"status\":{\"stringValue\":\"pending\"},";
+  json += "\"timestamp\":{\"timestampValue\":\"" + isoTime() + "\"}";
+  json += "} }";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.POST(json);
+  http.end();
+}
+
+// ================= CLOUD SAFETY =================
+void handleUnlink(String pairedTo) {
+  if (pairedTo.length() == 0 && readCaregiverId().length() > 0) {
+    saveField(CAREGIVER_ADDR, "");
+    fallState = IDLE;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void handleWifiReset() {
+  Serial.println("🔥 HARD WIFI RESET → REBOOT TO AP");
+
+  saveField(SSID_ADDR, "");
+  saveField(PASS_ADDR, "");
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(1500);
+
+  ESP.restart();  // ✅ CLEAN REBOOT
+}
+
+void pollCloud() {
+
+  if (!tcpipReady) return;
+
+  if (waitingCloudClear) {
+    Serial.println("⛔ Waiting for cloud to clear reset flags");
+    return;
+  }
+
+  if (wifiResetHandledThisBoot) return;
+
+  if (fallState == ALERT_PENDING || fallState == POST_ALERT) {
+    Serial.println("⛔ WiFi reset blocked (active fall)");
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (wifiConnectedAt == 0) return;
+  if (millis() - wifiConnectedAt < WIFI_SETTLE_TIME) return;
+
+  if (getWifiResetFlag()) return;
+
+  HTTPClient http;
+  http.begin(deviceURL);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  // --- STRICT wifiReset = true ---
+  int r = body.indexOf("wifiReset");
+  if (r == -1) return;
+
+  int rb = body.indexOf("booleanValue", r);
+  if (rb == -1 || body.indexOf("true", rb) == -1) return;
+
+  // --- STRICT wifiResetAck = false ---
+  int a = body.indexOf("wifiResetAck");
+  if (a != -1) {
+    int ab = body.indexOf("booleanValue", a);
+    if (ab != -1 && body.indexOf("true", ab) != -1) {
+      Serial.println("⏭ Reset already ACKed — skipping");
+      return;
+    }
+  }
+
+  Serial.println("🔥 CLOUD WIFI RESET CONFIRMED");
+
+  // =========================================================
+  // ✅ CRITICAL FIX — MARK RESETTING BEFORE DISCONNECT
+  // =========================================================
+  markDeviceResetting();
+  delay(800);  // allow Firestore propagation
+
+  wifiResetHandledThisBoot = true;
+  waitingCloudClear = true; // 🔒 BLOCK CLOUD UNTIL CLEAN
+
+  // ACK
+  HTTPClient ack;
+  ack.begin(deviceURL + "&updateMask.fieldPaths=wifiResetAck");
+  ack.addHeader("Content-Type", "application/json");
+  ack.PATCH("{\"fields\":{\"wifiResetAck\":{\"booleanValue\":true}}}");
+  ack.end();
+
+  // Clear reset flag
+  HTTPClient clear;
+  clear.begin(deviceURL + "&updateMask.fieldPaths=wifiReset");
+  clear.addHeader("Content-Type", "application/json");
+  clear.PATCH("{\"fields\":{\"wifiReset\":{\"booleanValue\":false}}}");
+  clear.end();
+
+  delay(300);
+
+  // =========================================================
+  // LOCAL HARD RESET
+  // =========================================================
+  saveField(SSID_ADDR, "");
+  saveField(PASS_ADDR, "");
+  setWifiResetFlag(true);
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(2000);
+
+  Serial.println("🔁 REBOOTING TO AP MODE");
+  ESP.restart();
+}
+
+
+
+
+
+// ================= FALL ENGINE =================
+void checkFall() {
+  static unsigned long postAlertAt = 0;
+
+  if (fallState == POST_ALERT) {
+    if (postAlertAt == 0) postAlertAt = millis();
+    if (millis() - postAlertAt > 15000) {
+      postAlertAt = 0;
+      fallState = IDLE;
+    }
+    return;
+  }
+
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float totalG = sqrt(
+    sq(a.acceleration.x / 9.81) +
+    sq(a.acceleration.y / 9.81) +
+    sq(a.acceleration.z / 9.81));
+
+  unsigned long now = millis();
+
+  if (fallState == IDLE && (totalG > IMPACT_G || abs(g.gyro.x) > ROT_SPIKE)) {
+    fallState = CANDIDATE;
+    fallTime = now;
+  }
+
+  if (fallState == CANDIDATE && now - fallTime > CONFIRM_DELAY) {
+    if (totalG < STILL_G) {
+      fallState = ALERT_PENDING;
+      alertStart = now;
+      updateDeviceDoc(true, "pending");
+    } else {
+      fallState = IDLE;
+    }
+  }
+
+  if (fallState == ALERT_PENDING) {
+    if (now - lastBuzz > BUZZ_INTERVAL) {
+      digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
+      lastBuzz = now;
+    }
+
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      digitalWrite(BUZZER_PIN, LOW);
+      updateDeviceDoc(false, "cancelled");
+      fallState = IDLE;
+    }
+
+    if (now - alertStart > CANCEL_WINDOW) {
+      digitalWrite(BUZZER_PIN, LOW);
+      createAlert();
+      fallState = POST_ALERT;
+    }
+  }
+}
+
+
+// ================= SETUP =================
+void setup() {
+    tcpipReady = false;   // ✅ ADD THIS
+  wifiConnectedAt = 0;  
+  waitingCloudClear = false;
+  wifiResetHandledThisBoot = false;
+
+// ✅ ADD THIS
+
+  Serial.begin(115200);
+  delay(1200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  Serial.println("\n=== SENRA HARD BOOT ===");
+
+  // HARD KILL RADIO FIRST
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(2500);
+
+  // 🔒 ABSOLUTE AP LOCK
+  if (getWifiResetFlag()) {
+    Serial.println("🔥 WIFI RESET FLAG FOUND — FORCING AP");
+
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
+    WiFi.setSleep(false);
+
+    WiFi.mode(WIFI_AP);
+    bool ok = WiFi.softAP("SENRA_SETUP");
+
+    Serial.print("AP START: ");
+    Serial.println(ok ? "OK" : "FAILED");
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+
+    server.on("/", handleRoot);
+    server.on("/setwifi", handleSetWiFi);
+    server.begin();
+
+    // HARD LOCK
+    while (true) {
+      server.handleClient();
+      delay(10);
+    }
+  }
+
+  // NORMAL BOOT
+  Serial.println("Normal boot...");
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BATTERY_PIN, INPUT);
+
+  Wire.begin(21, 22);
+  mpu.begin();
+  
+
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  SIM800.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
+  connectWiFi();
+}
+
+
+
+
+// ================= LOOP =================
+void loop() {
+
+  server.handleClient();
+  readGPS();
+  checkFall();
+
+  static bool wasConnected = false;
+
+  // 🔴 WiFi LOST → mark OFFLINE once
+  if (WiFi.status() != WL_CONNECTED) {
+
+    if (wasConnected) {
+      Serial.println("🔴 WiFi lost → marking OFFLINE");
+      markDeviceOffline();
+      wasConnected = false;
+    }
+
+    tcpipReady = false;
+    return;
+  }
+
+  // 🟢 WiFi reconnected
+  if (!wasConnected) {
+    Serial.println("🟢 WiFi reconnected");
+    wasConnected = true;
+    wifiConnectedAt = millis();
+  }
+
+  // 🟢 ONLINE STABILIZATION
+  if (!tcpipReady &&
+      wifiConnectedAt != 0 &&
+      millis() - wifiConnectedAt > WIFI_SETTLE_TIME) {
+
+    tcpipReady = true;
+    Serial.println("✅ TCP/IP stack stabilized");
+
+    // 🔥 FIRST ONLINE SYNC
+    updateDeviceDoc(false, "none");
+    lastSyncSend = millis();
+  }
+
+  // 🔍 KEEP WAITING UNTIL CLOUD RESET IS CLEAN
+  if (tcpipReady && waitingCloudClear) {
+
+    HTTPClient check;
+    check.begin(deviceURL);
+    int code = check.GET();
+
+    if (code == 200) {
+      String body = check.getString();
+
+      bool resetStillTrue = false;
+      int r = body.indexOf("wifiReset");
+
+      if (r != -1) {
+        int rb = body.indexOf("booleanValue", r);
+        if (rb != -1 && body.indexOf("true", rb) != -1) {
+          resetStillTrue = true;
+        }
+      }
+
+      if (!resetStillTrue) {
+        waitingCloudClear = false;
+        Serial.println("🔓 Cloud clean — normal mode");
+      } else {
+        waitingCloudClear = true;
+        Serial.println("⏳ Waiting cloud reset flag...");
+      }
+    }
+    check.end();
+  }
+
+  // 🔁 HEARTBEAT
+  if (tcpipReady && millis() - lastSyncSend > 20000) {
+
+    bool fallActive =
+      (fallState == ALERT_PENDING || fallState == POST_ALERT);
+
+    String fallStatus =
+      (fallState == ALERT_PENDING) ? "pending" :
+      (fallState == POST_ALERT)    ? "sent" :
+                                     "none";
+
+    updateDeviceDoc(fallActive, fallStatus);
+    lastSyncSend = millis();
+  }
+
+  // ☁️ CLOUD COMMANDS
+  if (tcpipReady && !waitingCloudClear &&
+      millis() - lastCloudCheck > 6000) {
+
+    pollCloud();
+    lastCloudCheck = millis();
+  }
+}

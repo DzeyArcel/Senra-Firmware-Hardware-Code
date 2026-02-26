@@ -1,0 +1,581 @@
+/*************************************************************
+   SENRA FIRMWARE V14.7 — FINAL ECO-SYSTEM
+   -----------------------------------------------------------
+   ✔ Stable WiFi ecosystem (connected → configured → setup_mode)
+   ✔ No infinite resets
+   ✔ Full EEPROM WiFi storage
+   ✔ Correct adminCommand handling
+   ✔ GPS + MPU6050 + SIM800 stable
+   ✔ Fall detection + cancel button
+   ✔ Firestore heartbeat every 20 sec
+   ✔ Debug logs ON
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ============================================================
+// CONFIG
+// ============================================================
+String DEVICE_ID   = "SNR-TEST-09";
+String PROJECT_ID  = "senra-805d0";
+String API_KEY     = "REPLACE_WITH_YOUR_KEY";
+
+String deviceURL =
+  "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+  "/databases/(default)/documents/devices/" + DEVICE_ID +
+  "?key=" + API_KEY;
+
+// ============================================================
+// EEPROM CONFIG
+// ============================================================
+#define EEPROM_SIZE 120
+#define SSID_ADDR 0
+#define PASS_ADDR 40
+
+// ============================================================
+// HARDWARE PINS
+// ============================================================
+#define BUZZER_PIN 25
+#define BUTTON_PIN 14
+#define GPS_RX 16
+#define GPS_TX 17
+#define SIM_RX 26
+#define SIM_TX 27
+
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+HardwareSerial SIM800(1);
+
+// ============================================================
+// RUNTIME STATE
+// ============================================================
+bool wifiResetRequested = false;
+bool fallTriggered = false;
+unsigned long fallTime = 0;
+unsigned long lastSyncSend = 0;
+
+String currentAlertId = "";
+double lastLat = 0;
+double lastLng = 0;
+
+// ============================================================
+// HELPER: LOGGING
+// ============================================================
+void log(String s) { Serial.println("[LOG] " + s); }
+
+// ============================================================
+// HELPER: TIMESTAMP
+// ============================================================
+String isoTime() {
+  time_t now; time(&now);
+  struct tm* t = gmtime(&now);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buf);
+}
+
+// ============================================================
+// EEPROM SAVE/READ
+// ============================================================
+void saveWiFi(String ssid, String pass) {
+  for (int i = 0; i < 32; i++) EEPROM.write(SSID_ADDR + i, i < ssid.length() ? ssid[i] : 0);
+  for (int i = 0; i < 32; i++) EEPROM.write(PASS_ADDR + i, i < pass.length() ? pass[i] : 0);
+  EEPROM.commit();
+  log("✔ WiFi Saved to EEPROM.");
+}
+
+String readSSID() {
+  char b[32];
+  for (int i = 0; i < 32; i++) b[i] = EEPROM.read(SSID_ADDR + i);
+  return String(b);
+}
+
+String readPASS() {
+  char b[32];
+  for (int i = 0; i < 32; i++) b[i] = EEPROM.read(PASS_ADDR + i);
+  return String(b);
+}
+
+void clearWiFiEEPROM() {
+  for (int i = 0; i < 64; i++) EEPROM.write(SSID_ADDR + i, 0);
+  EEPROM.commit();
+  log("⚠ EEPROM WiFi Cleared.");
+}
+
+// ============================================================
+// AP MODE — WIFI SETUP PAGE
+// ============================================================
+WebServer server(80);
+
+void handleRoot() {
+  server.send(200, "text/html",
+    "<h1>SENRA WiFi Setup</h1>"
+    "<form action='/setwifi'>"
+    "SSID: <input name='s'><br>"
+    "PASS: <input name='p'><br>"
+    "<input type='submit' value='Save'></form>");
+}
+
+void handleSetWiFi() {
+  String s = server.arg("s");
+  String p = server.arg("p");
+
+  saveWiFi(s, p);
+
+  server.send(200, "text/html", "<h1>Saved! Restarting…</h1>");
+  delay(1500);
+  ESP.restart();
+}
+
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("SENRA_SETUP");
+  server.on("/", handleRoot);
+  server.on("/setwifi", handleSetWiFi);
+  server.begin();
+  log("📡 AP Mode Enabled (SENRA_SETUP)");
+}
+
+// ============================================================
+// PATCH FIELD — FIRESTORE
+// ============================================================
+void patchField(String field, String jsonValue) {
+  HTTPClient http;
+  String url = deviceURL + "&updateMask.fieldPaths=" + field;
+
+  String json = "{ \"fields\": {" + field + ": " + jsonValue + "} }";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(json);
+  http.end();
+}
+
+// ============================================================
+// ADMIN COMMAND CHECK
+// ============================================================
+void clearAdminCommand() {
+  patchField("adminCommand", "{\"stringValue\":\"\"}");
+  log("✔ adminCommand cleared");
+}
+
+void checkAdminCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(deviceURL);
+  int code = http.GET();
+
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  if (payload.indexOf("\"wifi_reset\"") != -1) {
+    wifiResetRequested = true;
+    log("⚠ WiFi Reset Requested from Admin");
+  }
+}
+
+// ============================================================
+// WIFI CONNECT FUNCTION
+// ============================================================
+bool connectWiFi() {
+  String ssid = readSSID();
+  String pass = readPASS();
+
+  if (ssid.length() < 1) {
+    log("⚠ No WiFi saved → Starting AP Mode");
+    startAP();
+    return false;
+  }
+
+  log("📡 Connecting to WiFi: " + ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 9000) {
+    delay(400);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    log("🎉 WiFi Connected");
+    patchField("wifiStatus", "{\"stringValue\":\"connected\"}");
+    patchField("wifiConfigured", "{\"booleanValue\":true}");
+    clearAdminCommand();
+    return true;
+  }
+
+  log("❌ WiFi failed → AP Mode");
+  startAP();
+  return false;
+}
+
+// ============================================================
+// GPS HANDLING
+// ============================================================
+void readGPS() {
+  while (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// ============================================================
+// SIM800 — NETWORK CHECK
+// ============================================================
+bool simAvailable() {
+  SIM800.println("AT+CSQ");
+  delay(150);
+
+  if (!SIM800.available()) return false;
+
+  String r = SIM800.readString();
+  return (r.indexOf("99") == -1); // 99 = no signal
+}
+
+// ============================================================
+// SIM800 — SEND SMS
+// ============================================================
+void sendSMS(String num, String msg) {
+  SIM800.println("AT+CMGF=1");  // SMS Text Mode
+  delay(150);
+  SIM800.print("AT+CMGS=\"");
+  SIM800.print(num);
+  SIM800.println("\"");
+  delay(150);
+  SIM800.print(msg);
+  SIM800.write(26); // CTRL+Z
+}
+
+// ============================================================
+// FIRESTORE — UPDATE DEVICE DOC (HEARTBEAT / STATUS)
+// ============================================================
+void updateDeviceDoc(bool fallDetected, String fallStatus) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String url =
+    deviceURL +
+    "&updateMask.fieldPaths=status"
+    "&updateMask.fieldPaths=batteryLevel"
+    "&updateMask.fieldPaths=fallDetected"
+    "&updateMask.fieldPaths=fallStatus"
+    "&updateMask.fieldPaths=currentAlertId"
+    "&updateMask.fieldPaths=lat"
+    "&updateMask.fieldPaths=lng"
+    "&updateMask.fieldPaths=lastSync";
+
+  String json = "{ \"fields\": {";
+
+  json += "\"status\":{\"stringValue\":\"online\"},";
+  json += "\"batteryLevel\":{\"integerValue\":\"" + String(random(80, 93)) + "\"},";
+  json += "\"fallDetected\":{\"booleanValue\":" + String(fallDetected ? "true" : "false") + "},";
+  json += "\"fallStatus\":{\"stringValue\":\"" + fallStatus + "\"},";
+  json += "\"currentAlertId\":{\"stringValue\":\"" + currentAlertId + "\"},";
+
+  if (lastLat != 0) json += "\"lat\":{\"doubleValue\":" + String(lastLat, 6) + "},";
+  if (lastLng != 0) json += "\"lng\":{\"doubleValue\":" + String(lastLng, 6) + "},";
+
+  json += "\"lastSync\":{\"timestampValue\":\"" + isoTime() + "\"}";
+
+  json += "} }";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(json);
+  http.end();
+}
+
+// ============================================================
+// FIRESTORE — CREATE ALERT DOCUMENT
+// ============================================================
+void createAlert() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No WiFi - cannot send alert");
+    return;
+  }
+
+  HTTPClient http;
+
+  String url =
+    "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+    "/databases/(default)/documents/alerts?key=" + API_KEY;
+
+  String mapURL =
+    "https://www.google.com/maps?q=" + String(lastLat, 6) + "," + String(lastLng, 6);
+
+  String json = "{ \"fields\": {";
+  json += "\"deviceId\": {\"stringValue\": \"" + DEVICE_ID + "\"},";
+  json += "\"lat\":       {\"doubleValue\": " + String(lastLat, 6) + "},";
+  json += "\"lng\":       {\"doubleValue\": " + String(lastLng, 6) + "},";
+  json += "\"location\":  {\"stringValue\": \"" + mapURL + "\"},";
+  json += "\"mapURL\":    {\"stringValue\": \"" + mapURL + "\"},";
+  json += "\"fallType\":  {\"stringValue\": \"Fall Detected\"},";
+  json += "\"delivered\": {\"booleanValue\": false},";
+  json += "\"status\":    {\"stringValue\": \"pending\"},";
+  json += "\"timestamp\": {\"timestampValue\":\"" + isoTime() + "\"}";
+  json += "} }";
+
+  // 🔥 DEBUG
+  Serial.println("🚨 Creating alert...");
+  Serial.println("POST URL: " + url);
+  Serial.println("JSON DATA: " + json);
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(json);
+
+  Serial.println("POST RESPONSE CODE: " + String(code));
+  String res = http.getString();
+  Serial.println("RESPONSE BODY: " + res);
+
+  if (code == 200) {
+    int pos = res.indexOf("/alerts/");
+    if (pos != -1) {
+      int s = pos + 8;
+      int e = res.indexOf("\"", s);
+      currentAlertId = res.substring(s, e);
+      Serial.println("✔ Alert Created → " + currentAlertId);
+    }
+  } else {
+    Serial.println("❌ Failed to create alert.");
+  }
+
+  http.end();
+}
+
+
+// ============================================================
+// FIRESTORE — CANCEL ALERT
+// ============================================================
+void cancelAlert() {
+  if (currentAlertId == "" || WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String url =
+    "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+    "/databases/(default)/documents/alerts/" + currentAlertId +
+    "?key=" + API_KEY;
+
+  String json =
+    "{ \"fields\": {"
+    "\"status\": {\"stringValue\": \"cancelled_by_device\"},"
+    "\"cancelled_at\": {\"timestampValue\": \"" + isoTime() + "\"}"
+    "} }";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(json);
+  http.end();
+
+  log("❌ Alert Cancelled");
+  currentAlertId = "";
+}
+// ============================================================
+// FALL DETECTION SYSTEM — CLEAN + STABLE
+// ============================================================
+//
+// FINAL THRESHOLDS FOR REAL-WORLD USE:
+//   IMPACT_G   = 2.2  (You may adjust)
+//   ROT_SPIKE  = 120°/s
+//   STILL_G    = 1.05 (device nearly still after impact)
+//
+// NOTE: For testing, you can lower IMPACT_G to 1.3
+// ============================================================
+
+const float IMPACT_G   = 1.3;   // impact detection
+const float ROT_SPIKE  = 120.0; // rotation spike
+const float STILL_G    = 1.05;  // stillness check
+
+void checkFall() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  // Convert accelerometer data to G-force
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+
+  float totalG = sqrt(ax * ax + ay * ay + az * az);  // magnitude of impact
+
+  // Gyroscope rotation
+  float rotX = abs(g.gyro.x);
+  float rotY = abs(g.gyro.y);
+  float rotZ = abs(g.gyro.z);
+
+  float rotMax = max(rotX, max(rotY, rotZ));
+
+  // ============================================================
+  // 1️⃣ TRIGGER POSSIBLE FALL
+  // ============================================================
+  if (!fallTriggered && (totalG > IMPACT_G || rotMax > ROT_SPIKE)) {
+    fallTriggered = true;
+    fallTime = millis();
+    log("⚠ Impact detected! G=" + String(totalG) + " | Rot=" + String(rotMax));
+  }
+
+  // ============================================================
+  // 2️⃣ VERIFY FALL (120ms later)
+  // ============================================================
+  if (fallTriggered && millis() - fallTime > 120) {
+    if (totalG < STILL_G) {
+
+      log("✔ FALL CONFIRMED → Sending ALERT");
+
+      // Firestore pre-alert update
+      updateDeviceDoc(true, "pending");
+
+      // ============================================================
+      // CANCEL WINDOW (8 SECONDS)
+      // ============================================================
+      for (int i = 0; i < 8; i++) {
+
+        // BUTTON PRESSED → CANCEL ALERT
+        if (digitalRead(BUTTON_PIN) == LOW) {
+          log("❌ CANCEL BUTTON pressed → Alert cancelled");
+          cancelAlert();
+          fallTriggered = false;
+          return;
+        }
+
+        // BUZZER WARNING
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(150);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(150);
+      }
+
+      // ============================================================
+      // 3️⃣ CREATE FIRESTORE ALERT
+      // ============================================================
+      createAlert();
+      updateDeviceDoc(true, "pending");
+
+      // SMS Fallback
+      if (simAvailable()) {
+        String msg =
+          "⚠ SENRA ALERT\n"
+          "Device: " + DEVICE_ID +
+          "\nLat: " + String(lastLat, 6) +
+          "\nLng: " + String(lastLng, 6);
+
+        sendSMS("+639123456789", msg);
+      }
+    }
+
+    fallTriggered = false;
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // MPU6050
+  Wire.begin(21, 22);
+  if (!mpu.begin()) {
+    log("❌ MPU6050 NOT FOUND");
+  } else {
+    log("✔ MPU6050 Ready");
+  }
+
+  // GPS + SIM800
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  SIM800.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+
+  // NTP Time sync (BEST OPTION)
+  configTime(0, 0,
+             "pool.ntp.org",
+             "time.google.com",
+             "time.nist.gov");
+
+  delay(500);
+
+  log("⏳ Booting…");
+
+  // TEMPORARY PROTECTION:
+  wifiResetRequested = false;
+
+  // Connect WiFi or start AP
+  connectWiFi();
+
+  // On boot, tell Firestore device is alive
+  patchField("status", "{\"stringValue\":\"online\"}");
+  patchField("lastSync", "{\"timestampValue\":\"" + isoTime() + "\"}");
+}
+
+// ============================================================
+// LOOP — CORE RUNTIME
+// ============================================================
+void loop() {
+  server.handleClient();   // AP mode handler
+  readGPS();               // Live GPS updates
+  checkFall();             // Fall detection system
+
+  // ================================
+  // CHECK FOR ADMIN COMMANDS
+  // ================================
+  if (WiFi.status() == WL_CONNECTED) {
+    checkAdminCommands();
+  }
+
+  // ================================
+  // HANDLE WIFI RESET REQUEST
+  // ================================
+  if (wifiResetRequested) {
+    log("⚠ WiFi RESET PROCESS STARTED");
+
+    // 1) Inform Firestore
+    patchField("wifiStatus", "{\"stringValue\":\"resetting\"}");
+    patchField("wifiConfigured", "{\"booleanValue\":false}");
+
+    // 2) Clear EEPROM WiFi
+    clearWiFiEEPROM();
+
+    // 3) Clear adminCommand
+    clearAdminCommand();
+
+    // 4) Restart after delay
+    delay(400);
+    ESP.restart();
+  }
+
+  // ================================
+  // HEARTBEAT EVERY 20 SECONDS
+  // ================================
+  if (WiFi.status() == WL_CONNECTED) {
+    if (millis() - lastSyncSend > 20000) {
+      updateDeviceDoc(false, "none");
+      lastSyncSend = millis();
+    }
+  }
+}

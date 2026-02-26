@@ -1,0 +1,271 @@
+/**************** SENRA FIRMWARE v1.0 PRODUCTION ****************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+/************ PINS ************/
+#define MPU_SDA 21
+#define MPU_SCL 22
+#define GPS_RX 16
+#define GPS_TX 17
+#define SIM_RX 26
+#define SIM_TX 27
+#define BUZZER_PIN 25
+#define BUTTON_PIN 14
+#define BATTERY_ADC 35
+
+/************ EEPROM ************/
+#define EEPROM_SIZE 200
+#define E_SSID 0
+#define E_PASS 40
+#define E_DEVICEID 80
+
+/************ OBJECTS ************/
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial SIM800(1);
+HardwareSerial GPS_Serial(2);
+
+/************ GLOBALS ************/
+String ssid = "", pass = "", deviceId = "";
+
+float accelMag_g, gyroMag_dps;
+float rollDeg, pitchDeg;
+unsigned long lastMicros = 0;
+
+/************ BATTERY ************/
+float readBattV() {
+  int raw = analogRead(BATTERY_ADC);
+  return ((raw / 4095.0) * 3.3) * 2.0;
+}
+int battPct(float v) {
+  if (v >= 4.2) return 100;
+  if (v <= 3.2) return 0;
+  return (v - 3.2) * 100 / (4.2 - 3.2);
+}
+
+/************ BUZZER ************/
+bool buzzerActive = false, buzzerState = false;
+unsigned long bzStart, bzTimer;
+
+void startBuzzer() {
+  buzzerActive = true;
+  bzStart = millis();
+  bzTimer = millis();
+}
+void stopBuzzer() {
+  buzzerActive = false;
+  buzzerState = false;
+  digitalWrite(BUZZER_PIN, LOW);
+}
+void updateBuzzer() {
+  if (!buzzerActive) return;
+  if (millis() - bzTimer >= 1000) {
+    bzTimer = millis();
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState);
+  }
+  if (millis() - bzStart >= 30000) stopBuzzer();
+}
+
+/************ BUTTON ************/
+bool btnState = false;
+unsigned long btnStart;
+bool longPress() {
+  bool p = digitalRead(BUTTON_PIN) == LOW;
+  if (p && !btnState) { btnState = true; btnStart = millis(); }
+  if (!p && btnState) { btnState = false; return false; }
+  if (btnState && millis() - btnStart >= 3000) { btnState = false; return true; }
+  return false;
+}
+
+/************ FALL CONSTANTS ************/
+const float IMP1 = 2.0, IMP2 = 2.7, GYRO_SPIKE = 130.0;
+const float STILL_MIN = 0.7, STILL_MAX = 1.3, STILL_GMAX = 40.0;
+
+const unsigned long GRACE = 400, STILL_MS = 1800, FWIN = 3000;
+const unsigned long PRIME_TIMEOUT = 3000, REIMPACT = 1200;
+const unsigned long COOLDOWN = 15000;
+
+/************ FALL STATES ************/
+bool fallPrimed = false;
+unsigned long tImpact1 = 0, tImpactLast = 0, tStill = 0, lastFall = 0;
+
+void resetFall() {
+  fallPrimed = false;
+  tImpact1 = tImpactLast = tStill = 0;
+}
+
+/************ ORIENTATION ************/
+void updateOR(float ax, float ay, float az, float gx, float gy) {
+  unsigned long now = micros();
+  if (lastMicros == 0) lastMicros = now;
+  float dt = (now - lastMicros) / 1e6;
+  lastMicros = now;
+
+  float accRoll = atan2(ay, az) * 57.3;
+  float accPitch = atan2(-ax, sqrt(ay*ay + az*az)) * 57.3;
+
+  static float rF=0, pF=0;
+  rF = 0.98*(rF + gx*57.3*dt) + 0.02*accRoll;
+  pF = 0.98*(pF + gy*57.3*dt) + 0.02*accPitch;
+
+  rollDeg = rF; 
+  pitchDeg = pF;
+}
+
+/************ GSM ************/
+void gsmSend(String num, String msg) {
+  SIM800.println("AT+CMGF=1"); delay(300);
+  SIM800.print("AT+CMGS=\""); SIM800.print(num); SIM800.println("\"");
+  delay(300);
+  SIM800.print(msg);
+  SIM800.write(26);
+  delay(3000);
+}
+
+/************ SMS MESSAGE ************/
+void sendSMSAlert(float lat, float lng, int pct) {
+  String msg = 
+    "SENRA ALERT:\nPossible fall detected.\n"
+    "Battery: " + String(pct) + "%\n"
+    "Location: https://maps.google.com/?q=" + String(lat,6) + "," + String(lng,6);
+
+  gsmSend("+639XXXXXXXXX", msg);
+  gsmSend("+639YYYYYYYYY", msg);
+  gsmSend("+639ZZZZZZZZZ", msg);
+}
+
+/************ CLOUD SEND ************/
+void sendCloud(float lat, float lng, int pct) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin("https://us-central1-YOURPROJECT.cloudfunctions.net/senraAlert");
+  http.addHeader("Content-Type", "application/json");
+  String body = "{\"deviceId\":\""+deviceId+"\",\"lat\":"+String(lat,6)+",\"lng\":"+String(lng,6)+",\"battery\":"+String(pct)+"}";
+  http.POST(body);
+  http.end();
+}
+
+/************ GPS ************/
+bool getGPS(float &lat, float &lng) {
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+    if (gps.location.isValid()) {
+      lat = gps.location.lat();
+      lng = gps.location.lng();
+      return true;
+    }
+  }
+  return false;
+}
+
+/************ WIFI ************/
+void loadWiFi() {
+  char s[40], p[40], d[40];
+  EEPROM.get(E_SSID, s); ssid = String(s);
+  EEPROM.get(E_PASS, p); pass = String(p);
+  EEPROM.get(E_DEVICEID, d); deviceId = String(d);
+}
+
+void connectWiFi() {
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 6000) delay(100);
+}
+
+/************ FALL ALERT ************/
+void handleFall() {
+  float lat=0, lng=0;
+  float v = readBattV();
+  int pct = battPct(v);
+
+  startBuzzer();
+  getGPS(lat, lng);
+
+  connectWiFi();
+  if (WiFi.status() == WL_CONNECTED) 
+    sendCloud(lat, lng, pct);
+  else 
+    sendSMSAlert(lat, lng, pct);
+}
+
+/************ SETUP ************/
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BATTERY_ADC, INPUT);
+
+  Wire.begin(MPU_SDA, MPU_SCL);
+  mpu.begin();
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  SIM800.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  loadWiFi();
+}
+
+/************ LOOP ************/
+void loop() {
+  updateBuzzer();
+  if (longPress()) { stopBuzzer(); resetFall(); }
+
+  unsigned long now = millis();
+  if (!fallPrimed && now - lastFall < COOLDOWN) return;
+
+  sensors_event_t a,g,temp;
+  mpu.getEvent(&a,&g,&temp);
+
+  float ax=a.acceleration.x/9.81, ay=a.acceleration.y/9.81, az=a.acceleration.z/9.81;
+  accelMag_g = sqrt(ax*ax + ay*ay + az*az);
+
+  float gx=g.gyro.x*57.3, gy=g.gyro.y*57.3, gz=g.gyro.z*57.3;
+  gyroMag_dps = sqrt(gx*gx + gy*gy + gz*gz);
+
+  updateOR(a.acceleration.x, a.acceleration.y, a.acceleration.z, g.gyro.x, g.gyro.y);
+
+  bool norm = accelMag_g > IMP1;
+  bool strong = accelMag_g > IMP2;
+  bool spin = gyroMag_dps > GYRO_SPIKE;
+
+  if (!fallPrimed && (strong || (norm && spin))) {
+    fallPrimed = true;
+    tImpact1 = tImpactLast = now;
+  }
+
+  if (!fallPrimed) return;
+
+  if (strong && now - tImpactLast < REIMPACT) tImpactLast = now;
+
+  if (now - tImpactLast < GRACE) return;
+
+  bool stillA = accelMag_g > STILL_MIN && accelMag_g < STILL_MAX;
+  bool stillG = gyroMag_dps < STILL_GMAX;
+
+  if (stillA && stillG) {
+    if (tStill == 0) tStill = now;
+    if (now - tStill >= STILL_MS) {
+      handleFall();
+      lastFall = millis();
+      resetFall();
+    }
+  } else {
+    tStill = 0;
+  }
+
+  if (now - tImpact1 > FWIN && tStill == 0) resetFall();
+}

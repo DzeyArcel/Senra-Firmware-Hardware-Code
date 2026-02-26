@@ -1,0 +1,199 @@
+/*************************************************************
+   SENRA FIRMWARE v6  
+   WiFi + Firestore + MPU6050 + GPS + GSM SMS Backup
+   DEVICE_ID = SNR-V6-01
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+
+// -------------------------------
+// CONFIG
+// -------------------------------
+#define EEPROM_SIZE 200
+String DEVICE_ID = "SNR-V6-01";
+
+const char* WIFI_SSID = "YOUR_WIFI";
+const char* WIFI_PASS = "YOUR_PASS";
+
+const char* PROJECT_ID = "senra-805d0";
+const char* API_KEY    = "YOUR_API_KEY_HERE";
+
+String firestoreURL =
+  "https://firestore.googleapis.com/v1/projects/" + String(PROJECT_ID) +
+  "/databases/(default)/documents/devices/" + DEVICE_ID +
+  "?key=" + API_KEY;
+
+// -------------------------------
+// MODULE SETUP
+// -------------------------------
+
+// GPS
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);   // pins 16/17
+#define GPS_RX 16
+#define GPS_TX 17
+
+double lastLat = 0;
+double lastLng = 0;
+
+// MPU6050
+Adafruit_MPU6050 mpu;
+
+// GSM – SIM800L
+HardwareSerial GSM(1);  // pins 26/27
+#define GSM_RX 26
+#define GSM_TX 27
+
+// -------------------------------
+// FALL SYSTEM
+// -------------------------------
+bool fallTriggered = false;
+unsigned long fallTime = 0;
+
+// -------------------------------
+// HELPERS
+// -------------------------------
+String timeISO() {
+  time_t now;
+  time(&now);
+  struct tm* t = gmtime(&now);
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buf);
+}
+
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// -------------------------------
+// SMS BACKUP
+// -------------------------------
+bool sendSMS(String number, String msg) {
+  GSM.println("AT"); delay(300);
+
+  GSM.println("AT+CSQ"); delay(300);
+
+  // If NO SIGNAL
+  if (!GSM.find("OK")) {
+    Serial.println("⚠️ GSM No signal!");
+    return false;
+  }
+
+  GSM.println("AT+CMGF=1"); delay(300);
+  GSM.print("AT+CMGS=\""); GSM.print(number); GSM.println("\"");
+  delay(300);
+  GSM.print(msg);
+  delay(300);
+  GSM.write(26);  // CTRL+Z
+  delay(2000);
+
+  Serial.println("📩 SMS Sent Backup!");
+  return true;
+}
+
+// -------------------------------
+// FIRESTORE SEND
+// -------------------------------
+void sendFallAlert() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ WiFi Offline → using SMS backup");
+    sendSMS("+639XXXXXXXXX", "SENRA FALL ALERT!\nGPS: " + String(lastLat,6) + "," + String(lastLng,6));
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(firestoreURL);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{ \"fields\": {";
+  payload += "\"fallDetected\":{\"booleanValue\":true},";
+  payload += "\"lat\":{\"doubleValue\":" + String(lastLat,6) + "},";
+  payload += "\"lng\":{\"doubleValue\":" + String(lastLng,6) + "},";
+  payload += "\"lastSync\":{\"timestampValue\":\"" + timeISO() + "\"}";
+  payload += "} }";
+
+  int code = http.PATCH(payload);
+  http.end();
+
+  Serial.println(code == 200 ? "🔥 Firestore Fall Sent" : "⚠️ FS error");
+}
+
+// -------------------------------
+// FALL DETECTION (Simple)
+// -------------------------------
+void checkFall() {
+  sensors_event_t a, g, temp;
+
+  if (!mpu.getEvent(&a, &g, &temp)) return;  // MPU error
+
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+
+  float totalG = sqrt(ax*ax + ay*ay + az*az);
+
+  if (totalG > 2.7 && !fallTriggered) {
+    fallTriggered = true;
+    fallTime = millis();
+  }
+
+  if (fallTriggered && millis() - fallTime > 300) {
+    if (totalG < 1.2) {
+      Serial.println("🚨 FALL DETECTED!");
+      sendFallAlert();
+    }
+    fallTriggered = false;
+  }
+}
+
+// -------------------------------
+// WIFI CONNECT
+// -------------------------------
+void connectWiFi() {
+  Serial.println("Connecting WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for (int i = 0; i < 20; i++) {
+    if (WiFi.status() == WL_CONNECTED) break;
+    delay(500); Serial.print(".");
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? "\n✓ WiFi Connected" : "\n❌ Failed WiFi");
+}
+
+// -------------------------------
+// SETUP
+// -------------------------------
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  // GPS
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // GSM
+  GSM.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+
+  // MPU
+  if (!mpu.begin()) Serial.println("⚠️ MPU6050 not found!");
+
+  connectWiFi();
+  configTime(0, 0, "pool.ntp.org");
+}
+
+// -------------------------------
+// LOOP
+// -------------------------------
+void loop() {
+  readGPS();
+  checkFall();
+}

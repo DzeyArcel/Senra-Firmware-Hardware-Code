@@ -1,0 +1,353 @@
+/*************************************************************
+   SENRA FIRMWARE V15.7 — FULL ECOSYSTEM SAFE
+   ✔ Firestore unlink safety
+   ✔ WiFi reset from app
+   ✔ Caregiver UID binding
+   ✔ Fall detection + buzzer
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ================= CONFIG =================
+String DEVICE_ID  = "SNR-TEST-10";
+String PROJECT_ID = "senra-805d0";
+String API_KEY    = "AIzaSyA6kFNDsJP3Pv1ltrWrMYh5Ie-dWnFMn6Q";
+
+String deviceURL =
+  "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+  "/databases/(default)/documents/devices/" + DEVICE_ID +
+  "?key=" + API_KEY;
+
+// ================= EEPROM =================
+#define EEPROM_SIZE 120
+#define SSID_ADDR 0
+#define PASS_ADDR 40
+#define CAREGIVER_ADDR 80
+
+// ================= PINS =================
+#define BUZZER_PIN 25
+#define BUTTON_PIN 14
+#define GPS_RX 16
+#define GPS_TX 17
+#define SIM_RX 26
+#define SIM_TX 27
+#define BATTERY_PIN 34
+
+// ================= OBJECTS =================
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+HardwareSerial SIM800(1);
+WebServer server(80);
+
+// ================= FALL STATE =================
+enum FallState { IDLE, CANDIDATE, ALERT_PENDING };
+FallState fallState = IDLE;
+
+unsigned long fallTime = 0;
+unsigned long alertStart = 0;
+unsigned long lastBuzz = 0;
+unsigned long lastSyncSend = 0;
+unsigned long lastCloudCheck = 0;
+
+double lastLat = 0;
+double lastLng = 0;
+
+// ================= CONSTANTS =================
+const float IMPACT_G = 1.2;
+const float ROT_SPIKE = 90;
+const float STILL_G = 1.05;
+
+const unsigned long CONFIRM_DELAY = 150;
+const unsigned long CANCEL_WINDOW = 8000;
+const unsigned long BUZZ_INTERVAL = 100;
+
+// ================= TIME =================
+String isoTime() {
+  time_t now; time(&now);
+  struct tm* t = gmtime(&now);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buf);
+}
+
+// ================= EEPROM =================
+void saveField(int addr, String v) {
+  for (int i = 0; i < 32; i++)
+    EEPROM.write(addr + i, i < v.length() ? v[i] : 0);
+  EEPROM.commit();
+}
+
+String readField(int addr) {
+  char b[33];
+  for (int i = 0; i < 32; i++) b[i] = EEPROM.read(addr + i);
+  b[32] = '\0';
+  return String(b);
+}
+
+String readSSID() { return readField(SSID_ADDR); }
+String readPASS() { return readField(PASS_ADDR); }
+String readCaregiverId() { return readField(CAREGIVER_ADDR); }
+
+// ================= AP MODE =================
+void handleRoot() {
+  server.send(200, "text/html",
+    "<h2>SENRA WiFi Setup</h2>"
+    "<form action='/setwifi'>SSID:<input name='s'><br>PASS:<input name='p'><br><input type='submit'></form>");
+}
+
+void handleSetWiFi() {
+  saveField(SSID_ADDR, server.arg("s"));
+  saveField(PASS_ADDR, server.arg("p"));
+  server.send(200, "text/html", "Saved. Restarting...");
+  delay(1500);
+  ESP.restart();
+}
+
+void handleSetCaregiver() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain", "Missing caregiver UID");
+    return;
+  }
+
+  String uid = server.arg("id");
+  uid.trim();
+
+  if (uid.length() < 20) {
+    server.send(400, "text/plain", "Invalid UID");
+    return;
+  }
+
+  saveField(CAREGIVER_ADDR, uid);
+  server.send(200, "text/plain", "Caregiver UID linked");
+}
+
+void startAP() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("SENRA_SETUP");
+  server.on("/", handleRoot);
+  server.on("/setwifi", handleSetWiFi);
+  server.on("/setcaregiver", handleSetCaregiver);
+  server.begin();
+}
+
+// ================= WIFI =================
+bool connectWiFi() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+
+  String ssid = readSSID(); ssid.trim();
+  String pass = readPASS(); pass.trim();
+
+  if (ssid.length() == 0) {
+    startAP();
+    return false;
+  }
+
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) delay(300);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    server.on("/setcaregiver", handleSetCaregiver);
+    server.begin();
+    return true;
+  }
+
+  startAP();
+  return false;
+}
+
+// ================= GPS =================
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// ================= BATTERY =================
+int readBatteryPercent() {
+  float v = analogRead(BATTERY_PIN) / 4095.0 * 3.3 * 2.0;
+  return constrain(map(v * 100, 330, 420, 0, 100), 0, 100);
+}
+
+// ================= FIRESTORE WRITE =================
+void updateDeviceDoc(bool fall, String status) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String json = "{ \"fields\": {";
+  json += "\"status\":{\"stringValue\":\"online\"},";
+  json += "\"fallDetected\":{\"booleanValue\":" + String(fall ? "true" : "false") + "},";
+  json += "\"fallStatus\":{\"stringValue\":\"" + status + "\"},";
+  json += "\"lat\":{\"doubleValue\":" + String(lastLat,6) + "},";
+  json += "\"lng\":{\"doubleValue\":" + String(lastLng,6) + "},";
+  json += "\"batteryLevel\":{\"integerValue\":\"" + String(readBatteryPercent()) + "\"},";
+  json += "\"lastSync\":{\"timestampValue\":\"" + isoTime() + "\"}";
+  json += "} }";
+
+  http.begin(deviceURL);
+  http.addHeader("Content-Type","application/json");
+  http.PATCH(json);
+  http.end();
+}
+
+// ================= ALERT =================
+void createAlert() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String caregiverId = readCaregiverId();
+  if (caregiverId.length() == 0) return;
+
+  HTTPClient http;
+  String url = "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+               "/databases/(default)/documents/alerts?key=" + API_KEY;
+
+  String json = "{ \"fields\": {";
+  json += "\"deviceId\":{\"stringValue\":\"" + DEVICE_ID + "\"},";
+  json += "\"caregiverId\":{\"stringValue\":\"" + caregiverId + "\"},";
+  json += "\"lat\":{\"doubleValue\":" + String(lastLat,6) + "},";
+  json += "\"lng\":{\"doubleValue\":" + String(lastLng,6) + "},";
+  json += "\"status\":{\"stringValue\":\"pending\"},";
+  json += "\"timestamp\":{\"timestampValue\":\"" + isoTime() + "\"}";
+  json += "} }";
+
+  http.begin(url);
+  http.addHeader("Content-Type","application/json");
+  http.POST(json);
+  http.end();
+}
+
+// ================= CLOUD SAFETY =================
+void handleUnlink(String pairedTo) {
+  if (pairedTo.length() == 0 && readCaregiverId().length() > 0) {
+    saveField(CAREGIVER_ADDR, "");
+    fallState = IDLE;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void handleWifiReset() {
+  saveField(SSID_ADDR, "");
+  saveField(PASS_ADDR, "");
+  delay(500);
+  ESP.restart();
+}
+
+void pollCloud() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(deviceURL);
+  int code = http.GET();
+
+  if (code == 200) {
+    String body = http.getString();
+
+    if (body.indexOf("\"paired_to\"") != -1 &&
+        body.indexOf("\"stringValue\":\"\"") != -1) {
+      handleUnlink("");
+    }
+
+    if (body.indexOf("reset_wifi") != -1) {
+      handleWifiReset();
+    }
+  }
+  http.end();
+}
+
+// ================= FALL ENGINE =================
+void checkFall() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float totalG = sqrt(
+    sq(a.acceleration.x / 9.81) +
+    sq(a.acceleration.y / 9.81) +
+    sq(a.acceleration.z / 9.81)
+  );
+
+  unsigned long now = millis();
+
+  if (fallState == IDLE &&
+      (totalG > IMPACT_G || abs(g.gyro.x) > ROT_SPIKE)) {
+    fallState = CANDIDATE;
+    fallTime = now;
+  }
+
+  if (fallState == CANDIDATE && now - fallTime > CONFIRM_DELAY) {
+    if (totalG < STILL_G) {
+      fallState = ALERT_PENDING;
+      alertStart = now;
+      updateDeviceDoc(true, "pending");
+    } else {
+      fallState = IDLE;
+    }
+  }
+
+  if (fallState == ALERT_PENDING) {
+    if (now - lastBuzz > BUZZ_INTERVAL) {
+      digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
+      lastBuzz = now;
+    }
+
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      digitalWrite(BUZZER_PIN, LOW);
+      updateDeviceDoc(false, "cancelled");
+      fallState = IDLE;
+    }
+
+    if (now - alertStart > CANCEL_WINDOW) {
+      digitalWrite(BUZZER_PIN, LOW);
+      createAlert();
+      fallState = IDLE;
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  EEPROM.begin(EEPROM_SIZE);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BATTERY_PIN, INPUT);
+
+  Wire.begin(21,22);
+  mpu.begin();
+
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  SIM800.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+
+  configTime(0,0,"pool.ntp.org","time.google.com");
+  connectWiFi();
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+  readGPS();
+  checkFall();
+
+  if (WiFi.status() == WL_CONNECTED && millis() - lastSyncSend > 20000) {
+    updateDeviceDoc(fallState == ALERT_PENDING,
+      fallState == ALERT_PENDING ? "pending" : "none");
+    lastSyncSend = millis();
+  }
+
+  if (millis() - lastCloudCheck > 5000) {
+    pollCloud();
+    lastCloudCheck = millis();
+  }
+}

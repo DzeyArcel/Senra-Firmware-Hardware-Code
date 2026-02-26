@@ -1,0 +1,372 @@
+/*************************************************************
+   SENRA FIRMWARE V12 — PRODUCTION VERSION
+   -----------------------------------------------------------
+   ✔ WiFi + Firestore heartbeat (update device record)
+   ✔ Fall detection (MPU6050)
+   ✔ GPS tracking (NEO-6M)
+   ✔ SIM800L SMS backup alerts
+   ✔ Buzzer + Cancel Button
+   ✔ WiFi Reset via AP Mode
+   ✔ Firestore Alerts Collection (CREATE alert document)
+*************************************************************/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <EEPROM.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// -----------------------------
+// PIN DEFINITIONS
+// -----------------------------
+#define BUZZER_PIN 25
+#define BUTTON_PIN 14
+#define GPS_RX     16
+#define GPS_TX     17
+#define SIM_RX     26
+#define SIM_TX     27
+
+// -----------------------------
+// GLOBAL OBJECTS
+// -----------------------------
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);  
+HardwareSerial SIM800(1);      
+
+// -----------------------------
+// FIRESTORE SETTINGS
+// -----------------------------
+String DEVICE_ID = "SNR-TEST-03";
+String PROJECT_ID = "senra-805d0";
+String API_KEY    = "AIzaSy4oKFNDsJP3Pv1tLwzWNhSte-dWnFMn6Q";
+
+String deviceURL =
+  "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+  "/databases/(default)/documents/devices/" + DEVICE_ID +
+  "?key=" + API_KEY;
+
+// -----------------------------
+// EEPROM STORAGE
+// -----------------------------
+#define EEPROM_SIZE 200
+String savedSSID = "";
+String savedPASS = "";
+
+// -----------------------------
+// STATE VARIABLES
+// -----------------------------
+bool fallTriggered = false;
+unsigned long fallTime = 0;
+
+double lastLat = 0;
+double lastLng = 0;
+
+unsigned long lastSend = 0;
+const unsigned long HEARTBEAT_MS = 20000;
+
+// ============================================================
+// EEPROM
+// ============================================================
+void saveCredentials(String ssid, String pass) {
+  EEPROM.writeString(0, ssid);
+  EEPROM.writeString(50, pass);
+  EEPROM.commit();
+}
+
+void loadCredentials() {
+  savedSSID = EEPROM.readString(0);
+  savedPASS = EEPROM.readString(50);
+}
+
+// ============================================================
+// WIFI & AP MODE
+// ============================================================
+WebServer server(80);
+
+String apPage() {
+  return "<h3>SENRA WiFi Setup</h3>"
+         "<form action='/save' method='POST'>"
+         "SSID:<input name='ssid'><br>"
+         "PASS:<input name='pass'><br>"
+         "<button>Save</button></form>";
+}
+
+void handleSave() {
+  saveCredentials(server.arg("ssid"), server.arg("pass"));
+  server.send(200, "text/html", "Saved! Rebooting...");
+  delay(700);
+  ESP.restart();
+}
+
+void startAP() {
+  WiFi.softAP("SENRA-Setup", "");
+  server.on("/", HTTP_GET, [] {
+    server.send(200, "text/html", apPage());
+  });
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  Serial.println("🔥 AP Mode Active → 192.168.4.1");
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+
+  Serial.print("Connecting");
+  for (int i = 0; i < 20; i++) {
+    if (WiFi.status() == WL_CONNECTED) break;
+    Serial.print(".");
+    delay(400);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n❌ WiFi Failed → AP Mode");
+    startAP();
+  } else {
+    Serial.println("\n✔ WiFi Connected!");
+  }
+}
+
+// ============================================================
+// UTILITIES
+// ============================================================
+String isoTime() {
+  time_t now;
+  time(&now);
+  struct tm *t = gmtime(&now);
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t);
+  return String(buf);
+}
+
+int batteryLevel() {
+  return random(78, 99); // placeholder
+}
+
+// ============================================================
+// SIM800L FUNCTIONS
+// ============================================================
+bool simAvailable() {
+  SIM800.println("AT+CSQ");
+  delay(500);
+
+  if (SIM800.available()) {
+    String r = SIM800.readString();
+    if (r.indexOf("99") != -1) return false;
+    return true;
+  }
+  return false;
+}
+
+void sendSMS(String number, String message) {
+  SIM800.println("AT+CMGF=1");
+  delay(300);
+
+  SIM800.print("AT+CMGS=\"");
+  SIM800.print(number);
+  SIM800.println("\"");
+  delay(300);
+
+  SIM800.print(message);
+  SIM800.write(26);
+  delay(500);
+
+  Serial.println("📩 SMS to " + number);
+}
+
+// ============================================================
+// GPS
+// ============================================================
+void readGPS() {
+  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+  }
+}
+
+// ============================================================
+// BUZZER + BUTTON
+// ============================================================
+void buzzAlert() {
+  digitalWrite(BUZZER_PIN, HIGH); delay(200);
+  digitalWrite(BUZZER_PIN, LOW);  delay(200);
+}
+
+bool buttonPressed() {
+  return digitalRead(BUTTON_PIN) == LOW;
+}
+
+// ============================================================
+// FIRESTORE — UPDATE DEVICE DOCUMENT
+// ============================================================
+void updateDeviceStatus() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = deviceURL +
+    "&updateMask.fieldPaths=status"
+    "&updateMask.fieldPaths=batteryLevel"
+    "&updateMask.fieldPaths=lat"
+    "&updateMask.fieldPaths=lng"
+    "&updateMask.fieldPaths=lastSync"
+    "&updateMask.fieldPaths=signal";
+
+  String json = "{ \"fields\": {";
+  json += "\"status\":{\"stringValue\":\"online\"},";
+  json += "\"batteryLevel\":{\"integerValue\":\"" + String(batteryLevel()) + "\"},";
+  json += "\"signal\":{\"stringValue\":\"" + String(WiFi.RSSI()) + "\"},";
+
+  if (lastLat != 0 && lastLng != 0) {
+    json += "\"lat\":{\"doubleValue\":" + String(lastLat, 6) + "},";
+    json += "\"lng\":{\"doubleValue\":" + String(lastLng, 6) + "},";
+  }
+
+  json += "\"lastSync\":{\"timestampValue\":\"" + isoTime() + "\"}";
+  json += "} }";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PATCH(json);
+  http.end();
+}
+
+// ============================================================
+// FIRESTORE — CREATE NEW ALERT DOCUMENT
+// ============================================================
+void sendFallAlertToFirestore() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url =
+    "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
+    "/databases/(default)/documents/alerts?key=" + API_KEY;
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  String mapURL = "https://www.google.com/maps?q=" +
+                  String(lastLat, 6) + "," + String(lastLng, 6);
+
+  String json = "{ \"fields\": {";
+
+  json += "\"deviceId\":{\"stringValue\":\"" + DEVICE_ID + "\"},";
+  json += "\"caregiverId\":{\"stringValue\":\"DEFAULT\"},";
+
+  json += "\"lat\":{\"doubleValue\":" + String(lastLat, 6) + "},";
+  json += "\"lng\":{\"doubleValue\":" + String(lastLng, 6) + "},";
+
+  json += "\"mapURL\":{\"stringValue\":\"" + mapURL + "\"},";
+  json += "\"fallType\":{\"stringValue\":\"Fall Detected\"},";
+
+  json += "\"timestamp\":{\"timestampValue\":\"" + isoTime() + "\"},";
+  json += "\"delivered\":{\"booleanValue\":false}";
+
+  json += "} }";
+
+  http.POST(json);
+  http.end();
+
+  Serial.println("✔ Firestore Alert Created");
+}
+
+// ============================================================
+// BACKUP SMS ALERT
+// ============================================================
+void sendBackupSMS() {
+  if (!simAvailable()) return;
+
+  String msg =
+    "⚠ SENRA FALL ALERT\n"
+    "Device: " + DEVICE_ID + "\n"
+    "Lat: " + String(lastLat, 6) + "\n"
+    "Lng: " + String(lastLng, 6);
+
+  sendSMS("+639123456789", msg);
+  sendSMS("+639876543210", msg);
+}
+
+// ============================================================
+// FALL DETECTION
+// ============================================================
+void checkFall() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+  float totalG = sqrt(ax*ax + ay*ay + az*az);
+
+  if (totalG >= 2.8 && !fallTriggered) {
+    fallTriggered = true;
+    fallTime = millis();
+  }
+
+  if (fallTriggered && millis() - fallTime > 300) {
+    if (totalG < 1.2) {
+      Serial.println("⚠ FALL DETECTED");
+
+      // Cancel window
+      for (int i = 0; i < 4; i++) {
+        if (buttonPressed()) {
+          Serial.println("🛑 Fall canceled");
+          fallTriggered = false;
+          return;
+        }
+        buzzAlert();
+      }
+
+      sendFallAlertToFirestore();
+      sendBackupSMS();
+    }
+
+    fallTriggered = false;
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  loadCredentials();
+
+  Wire.begin(21, 22);
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  SIM800.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+
+  if (!mpu.begin()) Serial.println("❌ MPU not found!");
+
+  if (savedSSID.length() == 0) startAP();
+  else connectWiFi();
+
+  configTime(0, 0, "pool.ntp.org");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+  server.handleClient();
+
+  readGPS();
+  checkFall();
+
+  if (millis() - lastSend > HEARTBEAT_MS &&
+      WiFi.status() == WL_CONNECTED) {
+    updateDeviceStatus();
+    lastSend = millis();
+  }
+}
