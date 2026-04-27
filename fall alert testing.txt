@@ -1,0 +1,143 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#define BUZZER_PIN 25
+#define BUTTON_PIN 14
+
+// ===== PRODUCTION FALL THRESHOLDS =====
+#define FREE_FALL_G 0.70
+#define IMPACT_G 2.4
+#define STILL_G 1.25
+#define ROT_SPIKE 200
+
+#define CONFIRM_DELAY 600
+#define STILL_CONFIRM 500
+#define IMPACT_TIMEOUT 1200
+
+Adafruit_MPU6050 mpu;
+
+enum FallState { IDLE, CANDIDATE, ALERT };
+
+FallState fallState = IDLE;
+
+unsigned long fallTime = 0;
+unsigned long lastBuzz = 0;
+bool buzzerState = false;
+
+bool freeFallDetected = false;
+unsigned long freeFallTime = 0;
+
+float filteredG = 1.0;
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin();
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not detected");
+    while (1);
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.println("SENRA FALL DETECTION TEST (PRODUCTION MODE)");
+}
+
+void loop() {
+
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float totalG = sqrt(
+    sq(a.acceleration.x / 9.81) +
+    sq(a.acceleration.y / 9.81) +
+    sq(a.acceleration.z / 9.81)
+  );
+
+  filteredG = 0.7 * filteredG + 0.3 * totalG;
+
+  float rot = max(max(abs(g.gyro.x), abs(g.gyro.y)), abs(g.gyro.z));
+
+  unsigned long now = millis();
+
+  // ================= BUTTON RESET =================
+  if (digitalRead(BUTTON_PIN) == LOW) {
+
+    Serial.println("RESET");
+
+    fallState = IDLE;
+    digitalWrite(BUZZER_PIN, LOW);
+    freeFallDetected = false;
+
+    delay(500);
+  }
+
+  // ================= IDLE =================
+  if (fallState == IDLE) {
+
+    if (filteredG < FREE_FALL_G) {
+
+      freeFallDetected = true;
+      freeFallTime = now;
+
+      Serial.println("FREE FALL");
+    }
+
+    if (freeFallDetected &&
+       (filteredG > IMPACT_G || rot > ROT_SPIKE)) {
+
+      Serial.println("FALL CANDIDATE");
+
+      fallState = CANDIDATE;
+      fallTime = now;
+
+      freeFallDetected = false;
+    }
+
+    if (freeFallDetected && now - freeFallTime > IMPACT_TIMEOUT) {
+      freeFallDetected = false;
+    }
+  }
+
+  // ================= CANDIDATE =================
+  if (fallState == CANDIDATE) {
+
+    if (now - fallTime > CONFIRM_DELAY) {
+
+      if (filteredG < STILL_G) {
+
+        Serial.println("FALL CONFIRMED");
+
+        fallState = ALERT;
+      }
+      else {
+
+        Serial.println("FALSE ALARM");
+
+        fallState = IDLE;
+      }
+    }
+  }
+
+  // ================= ALERT =================
+  if (fallState == ALERT) {
+
+    if (now - lastBuzz > 200) {
+
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState);
+
+      lastBuzz = now;
+    }
+  }
+
+  delay(10);
+} 
